@@ -25,7 +25,7 @@ export default function LottiePreview({ animationData, className = '' }: LottieP
       renderer: 'svg',
       loop: true,
       autoplay: true,
-      animationData: animationData,
+      animationData: structuredClone(animationData),
     });
 
     return () => {
