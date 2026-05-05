@@ -122,6 +122,9 @@ interface LottieItem {
   fileSize: number;
   originalAnimation: LottieAnimation;
   result: OptimizationResult;
+  options: OptimizationOptions;
+  colorOverrides: Record<string, string>;
+  appliedColors: Record<string, string>;
 }
 
 function OptRow({ label, checked, onChange }: {
@@ -142,7 +145,6 @@ export default function Home() {
   const [items, setItems] = useState<LottieItem[]>([]);
   const [error, setError] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [options, setOptions] = useState<OptimizationOptions>(defaultOptions);
   const [isDragging, setIsDragging] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [previewKey, setPreviewKey] = useState(0);
@@ -153,8 +155,6 @@ export default function Home() {
   const [bgOpen, setBgOpen] = useState(false);
   const [previewBg, setPreviewBg] = useState('');
   const [bgHexInput, setBgHexInput] = useState('');
-  const [colorOverrides, setColorOverrides] = useState<Record<string, string>>({});
-  const [appliedColors, setAppliedColors] = useState<Record<string, string>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const active = items.find(i => i.id === activeId);
@@ -166,19 +166,19 @@ export default function Home() {
 
   const coloredOptimized = useMemo(() => {
     if (!active) return null;
-    return applyColorOverrides(active.result.optimizedAnimation, appliedColors);
-  }, [active, appliedColors]);
+    return applyColorOverrides(active.result.optimizedAnimation, active.appliedColors);
+  }, [active]);
 
   /* Pre-compute exact download data — same string for size display AND download */
   const downloadData = useMemo(() => {
     const map = new Map<string, { json: string; size: number }>();
     for (const item of items) {
-      const anim = applyColorOverrides(item.result.optimizedAnimation, appliedColors);
+      const anim = applyColorOverrides(item.result.optimizedAnimation, item.appliedColors);
       const json = JSON.stringify(anim);
       map.set(item.id, { json, size: new Blob([json]).size });
     }
     return map;
-  }, [items, appliedColors]);
+  }, [items]);
 
   const processFiles = useCallback(async (files: File[]) => {
     setError('');
@@ -191,8 +191,18 @@ export default function Home() {
         let json: unknown;
         try { json = JSON.parse(text); } catch { errors.push(`${file.name}: Invalid JSON`); continue; }
         if (!validateLottie(json)) { errors.push(`${file.name}: Not valid Lottie`); continue; }
-        const result = optimizeLottie(json, options);
-        newItems.push({ id: crypto.randomUUID(), fileName: file.name, fileSize: file.size, originalAnimation: json, result });
+        const initialOptions: OptimizationOptions = { ...defaultOptions };
+        const result = optimizeLottie(json, initialOptions);
+        newItems.push({
+          id: crypto.randomUUID(),
+          fileName: file.name,
+          fileSize: file.size,
+          originalAnimation: json,
+          result,
+          options: initialOptions,
+          colorOverrides: {},
+          appliedColors: {},
+        });
       } catch { errors.push(`${file.name}: Failed`); }
     }
     if (newItems.length > 0) {
@@ -201,7 +211,7 @@ export default function Home() {
     }
     if (errors.length > 0) setError(errors.join('. '));
     setIsProcessing(false);
-  }, [options, activeId]);
+  }, [activeId]);
 
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
@@ -253,22 +263,31 @@ export default function Home() {
   }, [activeId]);
 
   const opt = useCallback((key: keyof OptimizationOptions, value: boolean | number) => {
-    setOptions(prev => ({ ...prev, [key]: value }));
-  }, []);
+    if (!activeId) return;
+    setItems(prev => prev.map(it =>
+      it.id === activeId ? { ...it, options: { ...it.options, [key]: value } } : it
+    ));
+  }, [activeId]);
 
   const regenerate = useCallback(() => {
-    if (items.length === 0) return;
+    if (!activeId) return;
     setIsProcessing(true);
     setTimeout(() => {
-      setItems(prev => prev.map(item => ({ ...item, result: optimizeLottie(item.originalAnimation, options) })));
-      setAppliedColors({ ...colorOverrides });
+      setItems(prev => prev.map(it => it.id === activeId
+        ? {
+            ...it,
+            result: optimizeLottie(it.originalAnimation, it.options),
+            appliedColors: { ...it.colorOverrides },
+          }
+        : it
+      ));
       setPreviewKey(k => k + 1);
       setIsProcessing(false);
     }, 100);
-  }, [items, options, colorOverrides]);
+  }, [activeId]);
 
   const resetAll = useCallback(() => {
-    setItems([]); setError(''); setActiveId(null); setColorOverrides({}); setAppliedColors({});
+    setItems([]); setError(''); setActiveId(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   }, []);
 
@@ -276,8 +295,9 @@ export default function Home() {
   const totalOptimized = items.reduce((s, i) => s + (downloadData.get(i.id)?.size ?? 0), 0);
   const totalPct = totalOriginal > 0 ? ((totalOriginal - totalOptimized) / totalOriginal) * 100 : 0;
   const hasItems = items.length > 0;
-  const hasColorOverrides = Object.keys(colorOverrides).length > 0;
-  const hasPendingColors = JSON.stringify(colorOverrides) !== JSON.stringify(appliedColors);
+  const hasColorOverrides = !!active && Object.keys(active.colorOverrides).length > 0;
+  const hasPendingColors = !!active &&
+    JSON.stringify(active.colorOverrides) !== JSON.stringify(active.appliedColors);
   const activeOptSize = active ? (downloadData.get(active.id)?.size ?? 0) : 0;
   const activePct = active && active.fileSize > 0
     ? ((active.fileSize - activeOptSize) / active.fileSize) * 100 : 0;
@@ -503,33 +523,37 @@ export default function Home() {
               <svg className={`ba-chevron ${safeOpen ? 'ba-chevron--open' : ''}`} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M6 9l6 6 6-6" /></svg>
             </button>
             {safeOpen && (
-              <div style={{ marginTop: '8px' }}>
-                <OptRow label="Remove hidden layers" checked={options.removeHiddenLayers} onChange={(v) => opt('removeHiddenLayers', v)} />
-                <OptRow label="Remove metadata" checked={options.removeMetadata} onChange={(v) => opt('removeMetadata', v)} />
-                <OptRow label="Remove empty groups" checked={options.removeEmptyGroups} onChange={(v) => opt('removeEmptyGroups', v)} />
-                <OptRow label="Simplify keyframes" checked={options.simplifyKeyframes} onChange={(v) => opt('simplifyKeyframes', v)} />
-                <OptRow label="Remove default values" checked={options.removeDefaultValues} onChange={(v) => opt('removeDefaultValues', v)} />
-                <OptRow label="Round decimals" checked={options.roundDecimals} onChange={(v) => opt('roundDecimals', v)} />
+              active ? (
+                <div style={{ marginTop: '8px' }}>
+                  <OptRow label="Remove hidden layers" checked={active.options.removeHiddenLayers} onChange={(v) => opt('removeHiddenLayers', v)} />
+                  <OptRow label="Remove metadata" checked={active.options.removeMetadata} onChange={(v) => opt('removeMetadata', v)} />
+                  <OptRow label="Remove empty groups" checked={active.options.removeEmptyGroups} onChange={(v) => opt('removeEmptyGroups', v)} />
+                  <OptRow label="Simplify keyframes" checked={active.options.simplifyKeyframes} onChange={(v) => opt('simplifyKeyframes', v)} />
+                  <OptRow label="Remove default values" checked={active.options.removeDefaultValues} onChange={(v) => opt('removeDefaultValues', v)} />
+                  <OptRow label="Round decimals" checked={active.options.roundDecimals} onChange={(v) => opt('roundDecimals', v)} />
 
-                {options.roundDecimals && (
-                  <div style={{ marginTop: '6px', padding: '8px 10px', background: 'var(--bn-surface)', borderRadius: 'var(--radius-sm)' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-                      <span className="ba-mono" style={{ fontSize: '11px', color: 'var(--bn-ink-3)' }}>Precision</span>
+                  {active.options.roundDecimals && (
+                    <div style={{ marginTop: '6px', padding: '8px 10px', background: 'var(--bn-surface)', borderRadius: 'var(--radius-sm)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                        <span className="ba-mono" style={{ fontSize: '11px', color: 'var(--bn-ink-3)' }}>Precision</span>
+                      </div>
+                      <div className="ba-precision-steps">
+                        {[0, 1, 2, 3, 4].map(v => (
+                          <button
+                            key={v}
+                            className={`ba-precision-step ${active.options.decimalPrecision === v ? 'ba-precision-step--active' : ''}`}
+                            onClick={() => opt('decimalPrecision', v)}
+                          >
+                            {v}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                    <div className="ba-precision-steps">
-                      {[0, 1, 2, 3, 4].map(v => (
-                        <button
-                          key={v}
-                          className={`ba-precision-step ${options.decimalPrecision === v ? 'ba-precision-step--active' : ''}`}
-                          onClick={() => opt('decimalPrecision', v)}
-                        >
-                          {v}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
+                  )}
+                </div>
+              ) : (
+                <p style={{ fontSize: '12px', color: 'var(--bn-ink-4)', marginTop: '10px' }}>No file selected</p>
+              )
             )}
           </div>
 
@@ -539,13 +563,17 @@ export default function Home() {
               <svg className={`ba-chevron ${aggressiveOpen ? 'ba-chevron--open' : ''}`} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M6 9l6 6 6-6" /></svg>
             </button>
             {aggressiveOpen && (
-              <div style={{ marginTop: '8px' }}>
-                <OptRow label="Remove expressions" checked={options.removeExpressions} onChange={(v) => opt('removeExpressions', v)} />
-                <OptRow label="Remove effects" checked={options.removeEffects} onChange={(v) => opt('removeEffects', v)} />
-                <OptRow label="Collapse transforms" checked={options.collapseTransforms} onChange={(v) => opt('collapseTransforms', v)} />
-                <OptRow label="Collapse static keyframes" checked={options.collapseDuplicateKeyframes} onChange={(v) => opt('collapseDuplicateKeyframes', v)} />
-                <OptRow label="Rename layers" checked={options.renameLayers} onChange={(v) => opt('renameLayers', v)} />
-              </div>
+              active ? (
+                <div style={{ marginTop: '8px' }}>
+                  <OptRow label="Remove expressions" checked={active.options.removeExpressions} onChange={(v) => opt('removeExpressions', v)} />
+                  <OptRow label="Remove effects" checked={active.options.removeEffects} onChange={(v) => opt('removeEffects', v)} />
+                  <OptRow label="Collapse transforms" checked={active.options.collapseTransforms} onChange={(v) => opt('collapseTransforms', v)} />
+                  <OptRow label="Collapse static keyframes" checked={active.options.collapseDuplicateKeyframes} onChange={(v) => opt('collapseDuplicateKeyframes', v)} />
+                  <OptRow label="Rename layers" checked={active.options.renameLayers} onChange={(v) => opt('renameLayers', v)} />
+                </div>
+              ) : (
+                <p style={{ fontSize: '12px', color: 'var(--bn-ink-4)', marginTop: '10px' }}>No file selected</p>
+              )
             )}
           </div>
 
@@ -566,20 +594,19 @@ export default function Home() {
                             {hex.toUpperCase()}
                           </span>
                           <svg width="10" height="10" fill="none" stroke="var(--bn-ink-4)" viewBox="0 0 24 24" style={{ flexShrink: 0 }}><path strokeLinecap="round" strokeWidth="2" d="M8 4l8 8-8 8" /></svg>
-                          <div className="ba-color-swatch" style={{ background: colorOverrides[hex] || hex, borderColor: colorOverrides[hex] ? 'var(--bn-blue)' : undefined }} />
+                          <div className="ba-color-swatch" style={{ background: active.colorOverrides[hex] || hex, borderColor: active.colorOverrides[hex] ? 'var(--bn-blue)' : undefined }} />
                           <input
                             type="color"
-                            value={colorOverrides[hex] || hex}
+                            value={active.colorOverrides[hex] || hex}
                             onChange={(e) => {
                               const newHex = e.target.value.toLowerCase();
-                              setColorOverrides(prev => {
-                                if (newHex === hex) {
-                                  const next = { ...prev };
-                                  delete next[hex];
-                                  return next;
-                                }
-                                return { ...prev, [hex]: newHex };
-                              });
+                              if (!activeId) return;
+                              setItems(prev => prev.map(it => {
+                                if (it.id !== activeId) return it;
+                                const next = { ...it.colorOverrides };
+                                if (newHex === hex) delete next[hex]; else next[hex] = newHex;
+                                return { ...it, colorOverrides: next };
+                              }));
                             }}
                             className="ba-color-input"
                           />
@@ -595,7 +622,13 @@ export default function Home() {
                       <button
                         className="ba-btn--ghost"
                         style={{ marginTop: '6px', width: '100%', justifyContent: 'center', fontSize: '11px' }}
-                        onClick={() => { setColorOverrides({}); setAppliedColors({}); setPreviewKey(k => k + 1); }}
+                        onClick={() => {
+                          if (!activeId) return;
+                          setItems(prev => prev.map(it =>
+                            it.id === activeId ? { ...it, colorOverrides: {}, appliedColors: {} } : it
+                          ));
+                          setPreviewKey(k => k + 1);
+                        }}
                       >
                         Reset colors
                       </button>
@@ -687,7 +720,7 @@ export default function Home() {
           </div>
 
           <div className="ba-inspector-footer">
-            <button onClick={regenerate} disabled={isProcessing || !hasItems} className="ba-btn" style={{ width: '100%', justifyContent: 'center' }}>
+            <button onClick={regenerate} disabled={isProcessing || !active} className="ba-btn" style={{ width: '100%', justifyContent: 'center' }}>
               {isProcessing ? 'Generating...' : 'Re-generate'}
             </button>
           </div>
