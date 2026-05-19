@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, useCallback, useRef, useMemo } from 'react';
+import { useState, useCallback, useRef, useMemo, useEffect } from 'react';
 import JSZip from 'jszip';
 import LottiePreview from '@/components/LottiePreview';
+import SVGPreview from '@/components/SVGPreview';
 import {
   LottieAnimation,
   OptimizationOptions,
@@ -12,6 +13,14 @@ import {
   validateLottie,
   formatBytes,
 } from '@/lib/lottie-optimizer';
+import {
+  SVGOptimizationOptions,
+  SVGOptimizationResult,
+  defaultSVGOptions,
+  optimizeSVG,
+  validateSVG,
+} from '@/lib/svg-optimizer';
+import { extractSVGColors, applySVGColorOverrides } from '@/lib/svg-colors';
 import './olive.css';
 
 /* ── Color utilities ── */
@@ -117,6 +126,7 @@ function applyColorOverrides(animation: LottieAnimation, overrides: Record<strin
 /* ── Components ── */
 
 interface LottieItem {
+  type: 'lottie';
   id: string;
   fileName: string;
   fileSize: number;
@@ -126,6 +136,20 @@ interface LottieItem {
   colorOverrides: Record<string, string>;
   appliedColors: Record<string, string>;
 }
+
+interface SVGItem {
+  type: 'svg';
+  id: string;
+  fileName: string;
+  fileSize: number;
+  originalSVG: string;
+  result: SVGOptimizationResult;
+  options: SVGOptimizationOptions;
+  colorOverrides: Record<string, string>;
+  appliedColors: Record<string, string>;
+}
+
+type Item = LottieItem | SVGItem;
 
 function OptRow({ label, checked, onChange }: {
   label: string; checked: boolean; onChange: (v: boolean) => void;
@@ -142,7 +166,7 @@ function OptRow({ label, checked, onChange }: {
 }
 
 export default function Home() {
-  const [items, setItems] = useState<LottieItem[]>([]);
+  const [items, setItems] = useState<Item[]>([]);
   const [error, setError] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -161,48 +185,106 @@ export default function Home() {
 
   const activeColors = useMemo(() => {
     if (!active) return [];
-    return extractColors(active.result.optimizedAnimation);
+    if (active.type === 'lottie') return extractColors(active.result.optimizedAnimation);
+    return extractSVGColors(active.result.optimizedSVG);
   }, [active]);
 
-  const coloredOptimized = useMemo(() => {
-    if (!active) return null;
+  const coloredOptimizedLottie = useMemo(() => {
+    if (!active || active.type !== 'lottie') return null;
     return applyColorOverrides(active.result.optimizedAnimation, active.appliedColors);
+  }, [active]);
+
+  const coloredOptimizedSVG = useMemo(() => {
+    if (!active || active.type !== 'svg') return null;
+    return applySVGColorOverrides(active.result.optimizedSVG, active.appliedColors);
   }, [active]);
 
   /* Pre-compute exact download data — same string for size display AND download */
   const downloadData = useMemo(() => {
-    const map = new Map<string, { json: string; size: number }>();
+    const map = new Map<string, { data: string; size: number; mime: string }>();
     for (const item of items) {
-      const anim = applyColorOverrides(item.result.optimizedAnimation, item.appliedColors);
-      const json = JSON.stringify(anim);
-      map.set(item.id, { json, size: new Blob([json]).size });
+      if (item.type === 'lottie') {
+        const anim = applyColorOverrides(item.result.optimizedAnimation, item.appliedColors);
+        const data = JSON.stringify(anim);
+        map.set(item.id, { data, size: new Blob([data]).size, mime: 'application/json' });
+      } else {
+        const data = applySVGColorOverrides(item.result.optimizedSVG, item.appliedColors);
+        map.set(item.id, { data, size: new Blob([data]).size, mime: 'image/svg+xml' });
+      }
     }
     return map;
   }, [items]);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return;
+      }
+      if (items.length < 2) return;
+      const idx = items.findIndex(i => i.id === activeId);
+      if (idx === -1) return;
+      const next = e.key === 'ArrowDown'
+        ? Math.min(idx + 1, items.length - 1)
+        : Math.max(idx - 1, 0);
+      e.preventDefault();
+      if (next === idx) return;
+      const nextId = items[next].id;
+      setActiveId(nextId);
+      requestAnimationFrame(() => {
+        document.querySelector(`[data-id="${nextId}"]`)?.scrollIntoView({ block: 'nearest' });
+      });
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [items, activeId]);
+
   const processFiles = useCallback(async (files: File[]) => {
     setError('');
     setIsProcessing(true);
-    const newItems: LottieItem[] = [];
+    const newItems: Item[] = [];
     const errors: string[] = [];
     for (const file of files) {
       try {
         const text = await file.text();
-        let json: unknown;
-        try { json = JSON.parse(text); } catch { errors.push(`${file.name}: Invalid JSON`); continue; }
-        if (!validateLottie(json)) { errors.push(`${file.name}: Not valid Lottie`); continue; }
-        const initialOptions: OptimizationOptions = { ...defaultOptions };
-        const result = optimizeLottie(json, initialOptions);
-        newItems.push({
-          id: crypto.randomUUID(),
-          fileName: file.name,
-          fileSize: file.size,
-          originalAnimation: json,
-          result,
-          options: initialOptions,
-          colorOverrides: {},
-          appliedColors: {},
-        });
+        const lower = file.name.toLowerCase();
+        if (lower.endsWith('.svg')) {
+          if (!validateSVG(text)) { errors.push(`${file.name}: Not valid SVG`); continue; }
+          const initialOptions: SVGOptimizationOptions = { ...defaultSVGOptions };
+          const result = optimizeSVG(text, initialOptions);
+          newItems.push({
+            type: 'svg',
+            id: crypto.randomUUID(),
+            fileName: file.name,
+            fileSize: file.size,
+            originalSVG: text,
+            result,
+            options: initialOptions,
+            colorOverrides: {},
+            appliedColors: {},
+          });
+        } else if (lower.endsWith('.json')) {
+          let json: unknown;
+          try { json = JSON.parse(text); } catch { errors.push(`${file.name}: Invalid JSON`); continue; }
+          if (!validateLottie(json)) { errors.push(`${file.name}: Not valid Lottie`); continue; }
+          const initialOptions: OptimizationOptions = { ...defaultOptions };
+          const result = optimizeLottie(json, initialOptions);
+          newItems.push({
+            type: 'lottie',
+            id: crypto.randomUUID(),
+            fileName: file.name,
+            fileSize: file.size,
+            originalAnimation: json,
+            result,
+            options: initialOptions,
+            colorOverrides: {},
+            appliedColors: {},
+          });
+        } else {
+          errors.push(`${file.name}: Unsupported file type`);
+        }
       } catch { errors.push(`${file.name}: Failed`); }
     }
     if (newItems.length > 0) {
@@ -223,14 +305,17 @@ export default function Home() {
   const handleDragLeave = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); }, []);
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault(); setIsDragging(false);
-    const files = Array.from(e.dataTransfer.files).filter(f => f.name.endsWith('.json'));
-    if (files.length > 0) processFiles(files); else setError('Drop .json files');
+    const files = Array.from(e.dataTransfer.files).filter(f => {
+      const n = f.name.toLowerCase();
+      return n.endsWith('.json') || n.endsWith('.svg');
+    });
+    if (files.length > 0) processFiles(files); else setError('Drop .json or .svg files');
   }, [processFiles]);
 
-  const handleDownload = useCallback((item: LottieItem) => {
+  const handleDownload = useCallback((item: Item) => {
     const data = downloadData.get(item.id);
     if (!data) return;
-    const blob = new Blob([data.json], { type: 'application/json' });
+    const blob = new Blob([data.data], { type: data.mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = item.fileName;
@@ -243,13 +328,12 @@ export default function Home() {
     for (const item of items) {
       const data = downloadData.get(item.id);
       if (!data) continue;
-      const name = item.fileName;
-      zip.file(name, data.json);
+      zip.file(item.fileName, data.data);
     }
     const blob = await zip.generateAsync({ type: 'blob' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = 'lottie.zip';
+    a.href = url; a.download = 'optimized.zip';
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }, [items, downloadData]);
@@ -265,7 +349,18 @@ export default function Home() {
   const opt = useCallback((key: keyof OptimizationOptions, value: boolean | number) => {
     if (!activeId) return;
     setItems(prev => prev.map(it =>
-      it.id === activeId ? { ...it, options: { ...it.options, [key]: value } } : it
+      it.id === activeId && it.type === 'lottie'
+        ? { ...it, options: { ...it.options, [key]: value } }
+        : it
+    ));
+  }, [activeId]);
+
+  const optSVG = useCallback((key: keyof SVGOptimizationOptions, value: boolean | number) => {
+    if (!activeId) return;
+    setItems(prev => prev.map(it =>
+      it.id === activeId && it.type === 'svg'
+        ? { ...it, options: { ...it.options, [key]: value } }
+        : it
     ));
   }, [activeId]);
 
@@ -273,14 +368,21 @@ export default function Home() {
     if (!activeId) return;
     setIsProcessing(true);
     setTimeout(() => {
-      setItems(prev => prev.map(it => it.id === activeId
-        ? {
+      setItems(prev => prev.map(it => {
+        if (it.id !== activeId) return it;
+        if (it.type === 'lottie') {
+          return {
             ...it,
             result: optimizeLottie(it.originalAnimation, it.options),
             appliedColors: { ...it.colorOverrides },
-          }
-        : it
-      ));
+          };
+        }
+        return {
+          ...it,
+          result: optimizeSVG(it.originalSVG, it.options),
+          appliedColors: { ...it.colorOverrides },
+        };
+      }));
       setPreviewKey(k => k + 1);
       setIsProcessing(false);
     }, 100);
@@ -338,6 +440,7 @@ export default function Home() {
                 {items.map(item => (
                   <div
                     key={item.id}
+                    data-id={item.id}
                     className={`ba-file ${activeId === item.id ? 'ba-file--active' : ''}`}
                     onClick={() => setActiveId(item.id)}
                   >
@@ -356,7 +459,7 @@ export default function Home() {
             ) : (
               <div style={{ padding: '20px 16px', textAlign: 'center' }}>
                 <p style={{ fontSize: '12px', color: 'var(--bn-ink-4)', lineHeight: 1.6 }}>
-                  No files yet. Drop .json files or click + to add.
+                  No files yet. Drop .json or .svg files or click + to add.
                 </p>
               </div>
             )}
@@ -401,7 +504,7 @@ export default function Home() {
                 Optimize your animations
               </h2>
               <p className="ba-anim ba-d3" style={{ fontSize: '13px', color: 'var(--bn-ink-3)', lineHeight: 1.7, marginBottom: '24px' }}>
-                Drop Lottie JSON files to shrink them without losing quality. Everything runs locally in your browser.
+                Drop Lottie JSON or SVG files to shrink them without losing quality. Everything runs locally in your browser.
               </p>
               <div
                 className={`ba-drop ba-anim ba-d4 ${isDragging ? 'ba-drop--active' : ''}`}
@@ -412,7 +515,7 @@ export default function Home() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
                 </svg>
                 <p style={{ fontSize: '14px', fontWeight: 500, color: 'var(--bn-ink-2)', marginBottom: '4px' }}>
-                  Drop .json files here
+                  Drop .json or .svg files here
                 </p>
                 <p style={{ fontSize: '12px', color: 'var(--bn-ink-4)' }}>
                   or <button className="ba-btn--link" style={{ fontSize: '12px' }} onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}>browse from your computer</button>
@@ -457,7 +560,11 @@ export default function Home() {
                     <span className="ba-mono" style={{ fontSize: '11px', color: 'var(--bn-ink-4)' }}>{formatBytes(active.fileSize)}</span>
                   </div>
                   <div className={`ba-preview-well${previewBg === 'checker' ? ' ba-preview-well--checker' : ''}`} style={previewBg && previewBg !== 'checker' ? { background: previewBg } : undefined}>
-                    <LottiePreview key={`orig-${active.id}-${previewKey}`} animationData={active.originalAnimation} className="max-w-full max-h-full" />
+                    {active.type === 'lottie' ? (
+                      <LottiePreview key={`orig-${active.id}-${previewKey}`} animationData={active.originalAnimation} className="max-w-full max-h-full" />
+                    ) : (
+                      <SVGPreview key={`orig-${active.id}-${previewKey}`} svg={active.originalSVG} className="max-w-full max-h-full" />
+                    )}
                   </div>
                 </div>
 
@@ -467,7 +574,11 @@ export default function Home() {
                     <span className="ba-mono" style={{ fontSize: '11px', color: 'var(--bn-green)' }}>{formatBytes(activeOptSize)}</span>
                   </div>
                   <div className={`ba-preview-well${previewBg === 'checker' ? ' ba-preview-well--checker' : ''}`} style={previewBg && previewBg !== 'checker' ? { background: previewBg } : undefined}>
-                    <LottiePreview key={`opt-${active.id}-${previewKey}`} animationData={coloredOptimized ?? active.result.optimizedAnimation} className="max-w-full max-h-full" />
+                    {active.type === 'lottie' ? (
+                      <LottiePreview key={`opt-${active.id}-${previewKey}`} animationData={coloredOptimizedLottie ?? active.result.optimizedAnimation} className="max-w-full max-h-full" />
+                    ) : (
+                      <SVGPreview key={`opt-${active.id}-${previewKey}`} svg={coloredOptimizedSVG ?? active.result.optimizedSVG} className="max-w-full max-h-full" />
+                    )}
                   </div>
                 </div>
               </div>
@@ -524,33 +635,66 @@ export default function Home() {
             </button>
             {safeOpen && (
               active ? (
-                <div style={{ marginTop: '8px' }}>
-                  <OptRow label="Remove hidden layers" checked={active.options.removeHiddenLayers} onChange={(v) => opt('removeHiddenLayers', v)} />
-                  <OptRow label="Remove metadata" checked={active.options.removeMetadata} onChange={(v) => opt('removeMetadata', v)} />
-                  <OptRow label="Remove empty groups" checked={active.options.removeEmptyGroups} onChange={(v) => opt('removeEmptyGroups', v)} />
-                  <OptRow label="Simplify keyframes" checked={active.options.simplifyKeyframes} onChange={(v) => opt('simplifyKeyframes', v)} />
-                  <OptRow label="Remove default values" checked={active.options.removeDefaultValues} onChange={(v) => opt('removeDefaultValues', v)} />
-                  <OptRow label="Round decimals" checked={active.options.roundDecimals} onChange={(v) => opt('roundDecimals', v)} />
+                active.type === 'lottie' ? (
+                  <div style={{ marginTop: '8px' }}>
+                    <OptRow label="Remove hidden layers" checked={active.options.removeHiddenLayers} onChange={(v) => opt('removeHiddenLayers', v)} />
+                    <OptRow label="Remove metadata" checked={active.options.removeMetadata} onChange={(v) => opt('removeMetadata', v)} />
+                    <OptRow label="Remove empty groups" checked={active.options.removeEmptyGroups} onChange={(v) => opt('removeEmptyGroups', v)} />
+                    <OptRow label="Simplify keyframes" checked={active.options.simplifyKeyframes} onChange={(v) => opt('simplifyKeyframes', v)} />
+                    <OptRow label="Remove default values" checked={active.options.removeDefaultValues} onChange={(v) => opt('removeDefaultValues', v)} />
+                    <OptRow label="Round decimals" checked={active.options.roundDecimals} onChange={(v) => opt('roundDecimals', v)} />
 
-                  {active.options.roundDecimals && (
-                    <div style={{ marginTop: '6px', padding: '8px 10px', background: 'var(--bn-surface)', borderRadius: 'var(--radius-sm)' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-                        <span className="ba-mono" style={{ fontSize: '11px', color: 'var(--bn-ink-3)' }}>Precision</span>
+                    {active.options.roundDecimals && (
+                      <div style={{ marginTop: '6px', padding: '8px 10px', background: 'var(--bn-surface)', borderRadius: 'var(--radius-sm)' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                          <span className="ba-mono" style={{ fontSize: '11px', color: 'var(--bn-ink-3)' }}>Precision</span>
+                        </div>
+                        <div className="ba-precision-steps">
+                          {[0, 1, 2, 3, 4].map(v => (
+                            <button
+                              key={v}
+                              className={`ba-precision-step ${active.options.decimalPrecision === v ? 'ba-precision-step--active' : ''}`}
+                              onClick={() => opt('decimalPrecision', v)}
+                            >
+                              {v}
+                            </button>
+                          ))}
+                        </div>
                       </div>
-                      <div className="ba-precision-steps">
-                        {[0, 1, 2, 3, 4].map(v => (
-                          <button
-                            key={v}
-                            className={`ba-precision-step ${active.options.decimalPrecision === v ? 'ba-precision-step--active' : ''}`}
-                            onClick={() => opt('decimalPrecision', v)}
-                          >
-                            {v}
-                          </button>
-                        ))}
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ marginTop: '8px' }}>
+                    <OptRow label="Remove comments" checked={active.options.removeComments} onChange={(v) => optSVG('removeComments', v)} />
+                    <OptRow label="Remove metadata" checked={active.options.removeMetadata} onChange={(v) => optSVG('removeMetadata', v)} />
+                    <OptRow label="Remove editor data" checked={active.options.removeEditorsNSData} onChange={(v) => optSVG('removeEditorsNSData', v)} />
+                    <OptRow label="Cleanup IDs" checked={active.options.cleanupIds} onChange={(v) => optSVG('cleanupIds', v)} />
+                    <OptRow label="Remove empty attrs" checked={active.options.removeEmptyAttrs} onChange={(v) => optSVG('removeEmptyAttrs', v)} />
+                    <OptRow label="Remove empty containers" checked={active.options.removeEmptyContainers} onChange={(v) => optSVG('removeEmptyContainers', v)} />
+                    <OptRow label="Collapse groups" checked={active.options.collapseGroups} onChange={(v) => optSVG('collapseGroups', v)} />
+                    <OptRow label="Remove unused namespaces" checked={active.options.removeUnusedNS} onChange={(v) => optSVG('removeUnusedNS', v)} />
+                    <OptRow label="Round decimals" checked={active.options.roundDecimals} onChange={(v) => optSVG('roundDecimals', v)} />
+
+                    {active.options.roundDecimals && (
+                      <div style={{ marginTop: '6px', padding: '8px 10px', background: 'var(--bn-surface)', borderRadius: 'var(--radius-sm)' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                          <span className="ba-mono" style={{ fontSize: '11px', color: 'var(--bn-ink-3)' }}>Precision</span>
+                        </div>
+                        <div className="ba-precision-steps">
+                          {[0, 1, 2, 3, 4].map(v => (
+                            <button
+                              key={v}
+                              className={`ba-precision-step ${active.options.decimalPrecision === v ? 'ba-precision-step--active' : ''}`}
+                              onClick={() => optSVG('decimalPrecision', v)}
+                            >
+                              {v}
+                            </button>
+                          ))}
+                        </div>
                       </div>
-                    </div>
-                  )}
-                </div>
+                    )}
+                  </div>
+                )
               ) : (
                 <p style={{ fontSize: '12px', color: 'var(--bn-ink-4)', marginTop: '10px' }}>No file selected</p>
               )
@@ -564,13 +708,24 @@ export default function Home() {
             </button>
             {aggressiveOpen && (
               active ? (
-                <div style={{ marginTop: '8px' }}>
-                  <OptRow label="Remove expressions" checked={active.options.removeExpressions} onChange={(v) => opt('removeExpressions', v)} />
-                  <OptRow label="Remove effects" checked={active.options.removeEffects} onChange={(v) => opt('removeEffects', v)} />
-                  <OptRow label="Collapse transforms" checked={active.options.collapseTransforms} onChange={(v) => opt('collapseTransforms', v)} />
-                  <OptRow label="Collapse static keyframes" checked={active.options.collapseDuplicateKeyframes} onChange={(v) => opt('collapseDuplicateKeyframes', v)} />
-                  <OptRow label="Rename layers" checked={active.options.renameLayers} onChange={(v) => opt('renameLayers', v)} />
-                </div>
+                active.type === 'lottie' ? (
+                  <div style={{ marginTop: '8px' }}>
+                    <OptRow label="Remove expressions" checked={active.options.removeExpressions} onChange={(v) => opt('removeExpressions', v)} />
+                    <OptRow label="Remove effects" checked={active.options.removeEffects} onChange={(v) => opt('removeEffects', v)} />
+                    <OptRow label="Collapse transforms" checked={active.options.collapseTransforms} onChange={(v) => opt('collapseTransforms', v)} />
+                    <OptRow label="Collapse static keyframes" checked={active.options.collapseDuplicateKeyframes} onChange={(v) => opt('collapseDuplicateKeyframes', v)} />
+                    <OptRow label="Rename layers" checked={active.options.renameLayers} onChange={(v) => opt('renameLayers', v)} />
+                  </div>
+                ) : (
+                  <div style={{ marginTop: '8px' }}>
+                    <OptRow label="Convert shapes to paths" checked={active.options.convertShapeToPath} onChange={(v) => optSVG('convertShapeToPath', v)} />
+                    <OptRow label="Merge paths" checked={active.options.mergePaths} onChange={(v) => optSVG('mergePaths', v)} />
+                    <OptRow label="Remove dimensions" checked={active.options.removeDimensions} onChange={(v) => optSVG('removeDimensions', v)} />
+                    <OptRow label="Remove <desc>" checked={active.options.removeDesc} onChange={(v) => optSVG('removeDesc', v)} />
+                    <OptRow label="Remove <title> (a11y)" checked={active.options.removeTitle} onChange={(v) => optSVG('removeTitle', v)} />
+                    <OptRow label="Sort attributes" checked={active.options.sortAttrs} onChange={(v) => optSVG('sortAttrs', v)} />
+                  </div>
+                )
               ) : (
                 <p style={{ fontSize: '12px', color: 'var(--bn-ink-4)', marginTop: '10px' }}>No file selected</p>
               )
@@ -727,7 +882,7 @@ export default function Home() {
         </div>
       </div>
 
-      <input ref={fileInputRef} type="file" accept=".json" multiple onChange={handleFileChange} style={{ display: 'none' }} />
+      <input ref={fileInputRef} type="file" accept=".json,.svg,application/json,image/svg+xml" multiple onChange={handleFileChange} style={{ display: 'none' }} />
     </div>
   );
 }
