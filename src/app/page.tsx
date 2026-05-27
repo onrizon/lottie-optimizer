@@ -252,11 +252,19 @@ export default function Home() {
         const lower = file.name.toLowerCase();
         if (lower.endsWith('.svg')) {
           if (!validateSVG(text)) { errors.push(`${file.name}: Not valid SVG`); continue; }
-          const initialOptions: SVGOptimizationOptions = { ...defaultSVGOptions };
+          const fileId = crypto.randomUUID();
+          // CSS class names cannot start with a digit — map each hex char (0-f)
+          // to a guaranteed letter (a-p) so the prefix is always valid CSS.
+          const h2l = (c: string) => String.fromCharCode(97 + parseInt(c, 16));
+          const initialOptions: SVGOptimizationOptions = {
+            ...defaultSVGOptions,
+            idPrefix: fileId.slice(0, 6) + '-',
+            classPrefix: h2l(fileId[6]) + h2l(fileId[7]),
+          };
           const result = optimizeSVG(text, initialOptions);
           newItems.push({
             type: 'svg',
-            id: crypto.randomUUID(),
+            id: fileId,
             fileName: file.name,
             fileSize: file.size,
             originalSVG: text,
@@ -355,7 +363,7 @@ export default function Home() {
     ));
   }, [activeId]);
 
-  const optSVG = useCallback((key: keyof SVGOptimizationOptions, value: boolean | number) => {
+  const optSVG = useCallback((key: keyof SVGOptimizationOptions, value: boolean | number | string) => {
     if (!activeId) return;
     setItems(prev => prev.map(it =>
       it.id === activeId && it.type === 'svg'
@@ -721,6 +729,8 @@ export default function Home() {
                     <OptRow label="Convert shapes to paths" checked={active.options.convertShapeToPath} onChange={(v) => optSVG('convertShapeToPath', v)} />
                     <OptRow label="Merge paths" checked={active.options.mergePaths} onChange={(v) => optSVG('mergePaths', v)} />
                     <OptRow label="Remove dimensions" checked={active.options.removeDimensions} onChange={(v) => optSVG('removeDimensions', v)} />
+                    <OptRow label="Set width/height 100%" checked={active.options.setDimensions100} onChange={(v) => optSVG('setDimensions100', v)} />
+                    <OptRow label="Prefix classes" checked={active.options.prefixClasses} onChange={(v) => optSVG('prefixClasses', v)} />
                     <OptRow label="Remove <desc>" checked={active.options.removeDesc} onChange={(v) => optSVG('removeDesc', v)} />
                     <OptRow label="Remove <title> (a11y)" checked={active.options.removeTitle} onChange={(v) => optSVG('removeTitle', v)} />
                     <OptRow label="Sort attributes" checked={active.options.sortAttrs} onChange={(v) => optSVG('sortAttrs', v)} />
